@@ -223,13 +223,23 @@ services:
 
         def main():
             entries = config["entries"]
-            filter_info = (" (filtre : " + str(len(slot_filter)) + " plage(s))") if slot_filter else " (tous créneaux)"
-            print(now() + " - Demarrage (" + str(len(entries)) + " medecin(s) surveille(s))" + filter_info)
+            days_names = {0:"lundi",1:"mardi",2:"mercredi",3:"jeudi",4:"vendredi",5:"samedi",6:"dimanche"}
+            names_str = "\n  - ".join(e["name"] for e in entries)
+            if slot_filter:
+                filter_lines = []
+                for f in slot_filter:
+                    sh, sm = divmod(f["start"], 60)
+                    eh, em = divmod(f["end"], 60)
+                    filter_lines.append(days_names.get(f["day"], "?") + " " + str(sh).zfill(2) + ":" + str(sm).zfill(2) + "-" + str(eh).zfill(2) + ":" + str(em).zfill(2))
+                filter_str = "\n  - ".join(filter_lines)
+            else:
+                filter_str = "tous creneaux"
+            print(now() + " - Demarrage\n  Medecins :\n  - " + names_str + "\n  Filtres  :\n  - " + filter_str)
             send_telegram(
                 "<b>Doctolib Checker demarre</b>\n" +
-                str(len(entries)) + " medecin(s) surveille(s)\n" +
-                "Jusqu au " + limit_date + " - toutes les " + str(config["interval_in_seconds"]) + "s" +
-                filter_info
+                "<b>Medecins :</b>\n- " + "\n- ".join(e["name"] for e in entries) + "\n" +
+                "<b>Filtres :</b>\n- " + filter_str.replace("\n  - ", "\n- ") + "\n" +
+                "Jusqu au " + limit_date + " - toutes les " + str(config["interval_in_seconds"]) + "s"
             )
             last_slots = {entry["name"]: None for entry in entries}
 
