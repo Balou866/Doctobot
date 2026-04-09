@@ -102,6 +102,13 @@ services:
       ALIVE_CHECK: "true"
       ALIVE_CHECK_HOUR: "9"
 
+      # ── FILTRE CRÉNEAUX (optionnel) ───────────────────────────────────────
+      # Laisser vide = tous les créneaux notifiés (comportement par défaut)
+      # Format : jour:HH:MM-HH:MM  (une plage par ligne)
+      # Jours : lundi mardi mercredi jeudi vendredi samedi dimanche
+      SLOT_FILTER: |
+        mercredi:13:00-19:00
+
       # ── TELEGRAM ─────────────────────────────────────────────────────────
       TELEGRAM_BOT_TOKEN: "VOTRE_BOT_TOKEN"
       TELEGRAM_CHAT_ID: "VOTRE_CHAT_ID"
@@ -117,6 +124,18 @@ services:
         while len(names) < len(urls):
             names.append("Medecin " + str(len(names) + 1))
         entries = [{"name": names[i], "url": urls[i]} for i in range(len(urls))]
+        slot_filter_raw = os.environ.get("SLOT_FILTER", "").strip()
+        slot_filter = []
+        days_fr = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,"vendredi":4,"samedi":5,"dimanche":6}
+        for line in slot_filter_raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            day_part, time_part = line.split(":", 1)
+            start_str, end_str = time_part.split("-")
+            sh, sm = map(int, start_str.split(":"))
+            eh, em = map(int, end_str.split(":"))
+            slot_filter.append({"day": days_fr.get(day_part.lower(), -1), "start": sh*60+sm, "end": eh*60+em})
         cfg = {
             "run_in_loop": True,
             "interval_in_seconds": int(os.environ.get("INTERVAL_SECONDS", 300)),
@@ -126,13 +145,14 @@ services:
             "start_date": today,
             "limit": int(os.environ.get("LIMIT", 15)),
             "entries": entries,
+            "slot_filter": slot_filter,
             "telegram": {
                 "bot_token": os.environ.get("TELEGRAM_BOT_TOKEN"),
                 "chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
             }
         }
         yaml.dump(cfg, open("/app/config.yaml", "w"))
-        print("Config OK - " + str(len(entries)) + " medecin(s) surveille(s)")
+        print("Config OK - " + str(len(entries)) + " medecin(s), " + str(len(slot_filter)) + " filtre(s) horaire(s)")
 
       CHECKER_SCRIPT: |
         import datetime, json, pathlib, time, urllib.parse, urllib.request, yaml
@@ -143,9 +163,21 @@ services:
         limit_date = config["limit_date"]
         limit = config["limit"]
         limit_dt = datetime.datetime.strptime(limit_date, "%Y-%m-%d")
+        slot_filter = config.get("slot_filter", [])
 
         def now():
             return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def slot_matches_filter(slot_str):
+            if not slot_filter:
+                return True
+            dt = datetime.datetime.strptime(slot_str[:-10], "%Y-%m-%dT%H:%M:%S")
+            wd = dt.weekday()
+            minutes = dt.hour * 60 + dt.minute
+            for f in slot_filter:
+                if f["day"] == wd and f["start"] <= minutes <= f["end"]:
+                    return True
+            return False
 
         def send_telegram(message):
             token = config["telegram"]["bot_token"]
@@ -178,7 +210,8 @@ services:
                         break
                     for slot in availability["slots"]:
                         slots.append(slot)
-            return slots, data
+            filtered = [s for s in slots if slot_matches_filter(s)]
+            return filtered, data
 
         def format_slots_message(slots):
             by_date = {}
@@ -190,11 +223,13 @@ services:
 
         def main():
             entries = config["entries"]
-            print(now() + " - Demarrage (" + str(len(entries)) + " medecin(s) surveille(s))")
+            filter_info = (" (filtre : " + str(len(slot_filter)) + " plage(s))") if slot_filter else " (tous créneaux)"
+            print(now() + " - Demarrage (" + str(len(entries)) + " medecin(s) surveille(s))" + filter_info)
             send_telegram(
                 "<b>Doctolib Checker demarre</b>\n" +
                 str(len(entries)) + " medecin(s) surveille(s)\n" +
-                "Jusqu au " + limit_date + " - toutes les " + str(config["interval_in_seconds"]) + "s"
+                "Jusqu au " + limit_date + " - toutes les " + str(config["interval_in_seconds"]) + "s" +
+                filter_info
             )
             last_slots = {entry["name"]: None for entry in entries}
 
@@ -273,6 +308,7 @@ services:
 | `TELEGRAM_CHAT_ID` | ✅ | Identifiant de ta conversation Telegram |
 | `ALIVE_CHECK` | ❌ | Envoie une notification quotidienne "le script tourne" (`true`/`false`) |
 | `ALIVE_CHECK_HOUR` | ❌ | Heure de la notification "alive" (format 24h, ex: `9`) |
+| `SLOT_FILTER` | ❌ | Plages horaires à surveiller — vide = tous les créneaux |
 
 ---
 
