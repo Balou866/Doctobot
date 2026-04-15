@@ -6,6 +6,7 @@ Script de surveillance Doctolib qui vérifie périodiquement la disponibilité d
 - Surveillance de **plusieurs médecins** simultanément
 - Notification uniquement sur **changement** (pas de spam si le même créneau reste disponible)
 - Détail complet des créneaux disponibles (date + heure) dans la notification
+- Gestion des **remplaçants** : choix d'inclure ou non leurs créneaux, avec indication du nom dans la notification
 - Déploiement 100% via Portainer (docker-compose), aucune ligne de commande
 
 ---
@@ -36,25 +37,26 @@ Script de surveillance Doctolib qui vérifie périodiquement la disponibilité d
 
 ---
 
-### 2. Récupérer l'URL Doctolib
+### 2. Récupérer les URLs Doctolib
 
-Pour chaque médecin à surveiller :
+#### URL API (obligatoire — `DOCTOLIB_URLS`)
 
-1. Va sur la page du médecin sur **Doctolib** et connecte-toi. Va sur une page de rendez vous comme si tu allais réserver (page "Choisissez la date de consultation").
+1. Va sur la page du médecin sur Doctolib et connecte-toi. Va sur la page de réservation (page "Choisissez la date de consultation").
 2. Ouvre les **Outils de développement** (`F12`) > onglet **Réseau**
 3. Filtre sur `availabilities`
-4. Clique sur le **dernier GET** qui apparaît
-5. **Copie l'URL complète**
-6. Dans l'URL copiée, remplace :
-   - la valeur de `start_date=2026-04-01` → `{start_date}`
-   - la valeur de `limit=15` → `{limit}`
+4. Clique sur le **dernier GET** `availabilities.json` qui apparaît
+5. **Copie l'URL complète** et colle-la dans `DOCTOLIB_URLS`
 
-L'URL finale ressemble à :
-```
-https://www.doctolib.fr/availabilities.json?visit_motive_ids=XXX&agenda_ids=XXX&...&start_date={start_date}&limit={limit}
-```
+> **Note :** Si l'URL contient `master_patient_signed_id`, il est automatiquement supprimé — les appels API se font sans identifiant de compte.
 
-> **Note :** L'URL contient un `master_patient_signed_id` lié à ton compte. Si les notifications s'arrêtent après quelques semaines, il faudra recopier une nouvelle URL.
+#### URL de réservation (optionnelle — `DOCTOLIB_BOOKING_URLS`)
+
+Si tu veux un **lien cliquable** dans les notifications Telegram pour accéder directement à la page de prise de rendez-vous :
+
+1. Depuis la même page de réservation Doctolib, **copie l'URL de la barre d'adresse du navigateur**
+2. Colle-la dans `DOCTOLIB_BOOKING_URLS` (même ordre que `DOCTOLIB_URLS`)
+
+> Les paramètres `masterPatientSignedId` et `master_patient_id` sont automatiquement supprimés de ce lien.
 
 ---
 
@@ -79,15 +81,20 @@ services:
     environment:
 
       # ── MÉDECINS À SURVEILLER ────────────────────────────────────────────
-      # Une URL par ligne (voir instructions ci-dessus pour obtenir l'URL)
+      # URL API (onglet Réseau > dernier GET availabilities.json) — une par ligne
       DOCTOLIB_URLS: |
-        https://www.doctolib.fr/availabilities.json?visit_motive_ids=XXX&agenda_ids=XXX&practice_ids=XXX&telehealth=false&start_date={start_date}&limit={limit}
-        # Ajouter d'autres URLs ici si besoin (un médecin par ligne)
+        https://www.doctolib.fr/availabilities.json?visit_motive_ids=XXX&agenda_ids=XXX&practice_ids=XXX&telehealth=false&start_date=2026-04-15&limit=5
 
       # Nom affiché dans les notifications (un nom par ligne, même ordre que les URLs)
       DOCTOLIB_NAMES: |
         Dr. Nom Prénom
-        # Dr. Autre Médecin
+
+      # URL de réservation pour lien cliquable dans les notifs (optionnel)
+      # URL de la barre d'adresse Doctolib — une par ligne, même ordre que DOCTOLIB_URLS
+      # Les paramètres masterPatientSignedId / master_patient_id sont supprimés automatiquement
+      # Laisser vide = pas de lien dans les notifications
+      DOCTOLIB_BOOKING_URLS: |
+        https://www.doctolib.fr/[specialite]/[ville]/[medecin]/booking/availabilities?...
 
       # ── DATES ET FENÊTRE ─────────────────────────────────────────────────
       # Ne notifier que si un créneau est disponible AVANT cette date
@@ -109,6 +116,11 @@ services:
       SLOT_FILTER: |
         mercredi:13:00-19:00
 
+      # ── REMPLAÇANTS ───────────────────────────────────────────────────────
+      # true  = notifier aussi les créneaux des remplaçants (nom indiqué dans la notif)
+      # false = uniquement les créneaux du praticien original
+      INCLUDE_SUBSTITUTES: "true"
+
       # ── TELEGRAM ─────────────────────────────────────────────────────────
       TELEGRAM_BOT_TOKEN: "VOTRE_BOT_TOKEN"
       TELEGRAM_CHAT_ID: "VOTRE_CHAT_ID"
@@ -117,13 +129,33 @@ services:
 
       # ── SCRIPTS (ne pas modifier) ─────────────────────────────────────────
       CONFIG_SCRIPT: |
-        import os, yaml, datetime
+        import os, yaml, datetime, urllib.parse
         today = datetime.date.today().strftime("%Y-%m-%d")
-        urls = [u.strip() for u in os.environ.get("DOCTOLIB_URLS", "").strip().splitlines() if u.strip()]
-        names = [n.strip() for n in os.environ.get("DOCTOLIB_NAMES", "").strip().splitlines() if n.strip()]
-        while len(names) < len(urls):
+        def normalize_api_url(url):
+            url = url.strip()
+            if '{start_date}' in url:
+                return url
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            clean = {k: v[0] for k, v in params.items() if k not in ('master_patient_signed_id', 'start_date', 'limit')}
+            base = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', urllib.parse.urlencode(clean), ''))
+            return base + '&start_date={start_date}&limit={limit}'
+        def clean_booking_url(url):
+            url = url.strip()
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            clean = {k: v[0] for k, v in params.items() if k not in ('masterPatientSignedId', 'master_patient_id', 'master_patient_signed_id')}
+            new_query = urllib.parse.urlencode(clean) if clean else ''
+            return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
+        raw_urls = [u for u in os.environ.get("DOCTOLIB_URLS", "").strip().splitlines() if u.strip() and not u.strip().startswith('#')]
+        names = [n.strip() for n in os.environ.get("DOCTOLIB_NAMES", "").strip().splitlines() if n.strip() and not n.strip().startswith('#')]
+        booking_raw = [u for u in os.environ.get("DOCTOLIB_BOOKING_URLS", "").strip().splitlines() if u.strip() and not u.strip().startswith('#')]
+        while len(names) < len(raw_urls):
             names.append("Medecin " + str(len(names) + 1))
-        entries = [{"name": names[i], "url": urls[i]} for i in range(len(urls))]
+        entries = []
+        for i, raw_url in enumerate(raw_urls):
+            booking_url = clean_booking_url(booking_raw[i]) if i < len(booking_raw) else None
+            entries.append({"name": names[i], "url": normalize_api_url(raw_url), "booking_url": booking_url})
         slot_filter_raw = os.environ.get("SLOT_FILTER", "").strip()
         slot_filter = []
         days_fr = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,"vendredi":4,"samedi":5,"dimanche":6}
@@ -146,13 +178,14 @@ services:
             "limit": int(os.environ.get("LIMIT", 15)),
             "entries": entries,
             "slot_filter": slot_filter,
+            "include_substitutes": os.environ.get("INCLUDE_SUBSTITUTES", "true").lower() == "true",
             "telegram": {
                 "bot_token": os.environ.get("TELEGRAM_BOT_TOKEN"),
                 "chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
             }
         }
         yaml.dump(cfg, open("/app/config.yaml", "w"))
-        print("Config OK - " + str(len(entries)) + " medecin(s), " + str(len(slot_filter)) + " filtre(s) horaire(s)")
+        print("Config OK - " + str(len(entries)) + " medecin(s), " + str(len(slot_filter)) + " filtre(s) horaire(s), remplacants: " + str(cfg["include_substitutes"]))
 
       CHECKER_SCRIPT: |
         import datetime, json, pathlib, time, urllib.parse, urllib.request, yaml
@@ -164,6 +197,7 @@ services:
         limit = config["limit"]
         limit_dt = datetime.datetime.strptime(limit_date, "%Y-%m-%d")
         slot_filter = config.get("slot_filter", [])
+        include_substitutes = config.get("include_substitutes", True)
 
         def now():
             return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -194,6 +228,22 @@ services:
             req = urllib.request.Request(u, headers={"User-Agent": "Magic Browser"})
             return json.loads(urllib.request.urlopen(req).read())
 
+        def parse_availability_slots(availability):
+            slots = availability.get("slots", [])
+            substitution = availability.get("substitution") or {}
+            substitute_map = {}
+            for sub_name, sub_info in substitution.items():
+                for s in sub_info.get("slots", []):
+                    substitute_map[s] = sub_name
+            result = []
+            for slot in slots:
+                sub_name = substitute_map.get(slot)
+                if sub_name is None:
+                    result.append((slot, None))
+                elif include_substitutes:
+                    result.append((slot, sub_name))
+            return result
+
         def get_all_slots(url_template):
             data = fetch(url_template, config["start_date"])
             slots = []
@@ -201,24 +251,25 @@ services:
                 for availability in data["availabilities"]:
                     if datetime.datetime.strptime(availability["date"][:10], "%Y-%m-%d") > limit_dt:
                         break
-                    for slot in availability["slots"]:
-                        slots.append(slot)
+                    slots.extend(parse_availability_slots(availability))
             elif data.get("next_slot") and datetime.datetime.strptime(data["next_slot"][:10], "%Y-%m-%d") <= limit_dt:
                 data2 = fetch(url_template, data["next_slot"][:10])
                 for availability in data2["availabilities"]:
                     if datetime.datetime.strptime(availability["date"][:10], "%Y-%m-%d") > limit_dt:
                         break
-                    for slot in availability["slots"]:
-                        slots.append(slot)
-            filtered = [s for s in slots if slot_matches_filter(s)]
+                    slots.extend(parse_availability_slots(availability))
+            filtered = [(s, sub) for s, sub in slots if slot_matches_filter(s)]
             return filtered, data
 
         def format_slots_message(slots):
             by_date = {}
-            for s in slots:
+            for s, sub in slots:
                 dt = datetime.datetime.strptime(s[:-10], "%Y-%m-%dT%H:%M:%S")
                 d = dt.strftime("%d/%m/%Y")
-                by_date.setdefault(d, []).append(dt.strftime("%H:%M"))
+                label = dt.strftime("%H:%M")
+                if sub:
+                    label += " (rempl.: " + sub + ")"
+                by_date.setdefault(d, []).append(label)
             return "\n".join(d + " : " + ", ".join(times) for d, times in sorted(by_date.items()))
 
         def main():
@@ -234,11 +285,13 @@ services:
                 filter_str = "\n  - ".join(filter_lines)
             else:
                 filter_str = "tous creneaux"
-            print(now() + " - Demarrage\n  Medecins :\n  - " + names_str + "\n  Filtres  :\n  - " + filter_str)
+            sub_str = "inclus" if include_substitutes else "exclus"
+            print(now() + " - Demarrage\n  Medecins :\n  - " + names_str + "\n  Filtres  :\n  - " + filter_str + "\n  Remplacants : " + sub_str)
             send_telegram(
                 "<b>Doctolib Checker demarre</b>\n" +
                 "<b>Medecins :</b>\n- " + "\n- ".join(e["name"] for e in entries) + "\n" +
                 "<b>Filtres :</b>\n- " + filter_str.replace("\n  - ", "\n- ") + "\n" +
+                "<b>Remplacants :</b> " + sub_str + "\n" +
                 "Jusqu au " + limit_date + " - toutes les " + str(config["interval_in_seconds"]) + "s"
             )
             last_slots = {entry["name"]: None for entry in entries}
@@ -256,7 +309,9 @@ services:
                         if current_slots != last_slots[name]:
                             if current_slots:
                                 msg = format_slots_message(current_slots)
-                                send_telegram("<b>" + str(len(current_slots)) + " creneau(x) - " + name + "</b>\n" + msg)
+                                booking_url = entry.get("booking_url")
+                                link = ('\n<a href="' + booking_url + '">Prendre rendez-vous</a>') if booking_url else ""
+                                send_telegram("<b>" + str(len(current_slots)) + " creneau(x) - " + name + "</b>\n" + msg + link)
                                 print(now() + " - ALERTE [" + name + "] : " + str(len(current_slots)) + " creneau(x)\n" + msg)
                             else:
                                 if last_slots[name] is not None:
@@ -309,8 +364,9 @@ services:
 
 | Variable | Obligatoire | Description |
 |---|---|---|
-| `DOCTOLIB_URLS` | ✅ | URLs Doctolib, une par ligne (voir instructions) |
+| `DOCTOLIB_URLS` | ✅ | URLs API Doctolib (`availabilities.json`), une par ligne (onglet Réseau) |
 | `DOCTOLIB_NAMES` | ✅ | Noms des médecins, un par ligne (même ordre que les URLs) |
+| `DOCTOLIB_BOOKING_URLS` | ❌ | URLs de réservation (barre d'adresse), une par ligne — active le lien cliquable dans les notifs |
 | `LIMIT_DATE` | ✅ | Date limite — ne notifie que si le créneau est avant cette date (`YYYY-MM-DD`) |
 | `LIMIT` | ✅ | Fenêtre de recherche en jours (max `15`, imposé par Doctolib) |
 | `INTERVAL_SECONDS` | ✅ | Intervalle entre chaque vérification en secondes (`300` = 5 min) |
@@ -319,6 +375,7 @@ services:
 | `ALIVE_CHECK` | ❌ | Envoie une notification quotidienne "le script tourne" (`true`/`false`) |
 | `ALIVE_CHECK_HOUR` | ❌ | Heure de la notification "alive" (format 24h, ex: `9`) |
 | `SLOT_FILTER` | ❌ | Plages horaires à surveiller — vide = tous les créneaux |
+| `INCLUDE_SUBSTITUTES` | ❌ | `true` = inclure les créneaux des remplaçants (défaut) / `false` = praticien original uniquement |
 
 ---
 
@@ -327,6 +384,8 @@ services:
 | Situation | Notification envoyée |
 |---|---|
 | Nouveaux créneaux détectés | ✅ Liste complète des créneaux par date |
+| Créneau avec un remplaçant | ✅ Heure suivie de `(rempl.: Dr. Nom)` si `INCLUDE_SUBSTITUTES=true` |
+| Créneaux disponibles (méthode A) | ✅ Lien cliquable "Prendre rendez-vous" inclus dans la notification |
 | Mêmes créneaux qu'au check précédent | ❌ Pas de spam |
 | Un ou plusieurs créneaux changent | ✅ Nouvelle liste complète |
 | Tous les créneaux disparaissent | ✅ "Plus de créneaux" |
@@ -335,16 +394,20 @@ services:
 
 ## Ajouter un second médecin
 
-Dans `DOCTOLIB_URLS`, ajouter une URL par ligne :
+Dans `DOCTOLIB_URLS`, ajouter une URL API par ligne. Même chose pour `DOCTOLIB_BOOKING_URLS` si tu veux les liens (même ordre) :
 
 ```yaml
 DOCTOLIB_URLS: |
-  https://www.doctolib.fr/availabilities.json?...&start_date={start_date}&limit={limit}
-  https://www.doctolib.fr/availabilities.json?...&start_date={start_date}&limit={limit}
+  https://www.doctolib.fr/availabilities.json?visit_motive_ids=AAA&agenda_ids=AAA&practice_ids=AAA&telehealth=false&start_date=2026-04-15&limit=5
+  https://www.doctolib.fr/availabilities.json?visit_motive_ids=BBB&agenda_ids=BBB&practice_ids=BBB&telehealth=false&start_date=2026-04-15&limit=5
 
 DOCTOLIB_NAMES: |
   Dr. Premier Médecin
   Dr. Second Médecin
+
+DOCTOLIB_BOOKING_URLS: |
+  https://www.doctolib.fr/[specialite]/[ville]/[medecin-1]/booking/availabilities?...
+  https://www.doctolib.fr/[specialite]/[ville]/[medecin-2]/booking/availabilities?...
 ```
 
 Chaque médecin est surveillé indépendamment — la notification indique le nom du médecin concerné.
